@@ -298,7 +298,7 @@ def report_metrics ():
         report_metrics_for_group(group)
         
 # Aggregate and report on metrics for the given groups, if all circuits in group are complete
-def finalize_group(group):
+def finalize_group(group, report=True):
 
     #print(f"... finalize group={group}")
 
@@ -312,7 +312,7 @@ def finalize_group(group):
             break
     
     #print(f"  ... group_done = {group} {group_done}")
-    if group_done:
+    if group_done and report:
         aggregate_metrics_for_group(group)
         print("************")
         report_metrics_for_group(group)
@@ -942,6 +942,25 @@ def store_app_metrics (backend_id, circuit_metrics, group_metrics, app, start_ti
     with open(filename, 'w+') as f:
         json.dump(shared_data, f, indent=2, sort_keys=True)
         f.close()
+
+iterations_metrics = {}
+# Separate out metrics for final vs. intermediate circuits
+def process_iteration_metrics(group_id):
+    global circuit_metrics
+    global iterations_metrics
+    g_id = str(group_id)
+    iterations_metrics[g_id] = {}
+    
+    for iteration, data in circuit_metrics[g_id].items():            
+        for key, value in data.items():
+            if iteration == '1':
+                iterations_metrics[g_id][key] = []
+            
+            iterations_metrics[g_id][key].append(value)
+      
+    del circuit_metrics[g_id]
+    return iterations_metrics
+    
  
 # Load the application metrics from the given data file
 # Returns a dict containing circuit and group metrics
@@ -1102,6 +1121,7 @@ def polarization_fidelity(counts, correct_dist, thermal_dist=None):
     fidelity = rescale_fidelity(fidelity, floor_fidelity, new_floor_fidelity)
 
     return fidelity
+
 
 ##############################################
 # VOLUMETRIC PLOT

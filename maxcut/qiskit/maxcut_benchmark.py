@@ -5,6 +5,8 @@ MaxCut Benchmark Program - Qiskit
 import sys
 import time
 from collections import namedtuple
+from functools import partial
+from copy import deepcopy
 
 import numpy as np
 from scipy.optimize import minimize
@@ -160,7 +162,7 @@ def analyze_and_print_result (qc, result, num_qubits, secret_int, num_shots):
 
     # use our polarization fidelity rescaling
     fidelity = metrics.polarization_fidelity(counts, expected_dist)
-
+    
     if verbose: print(f"For secret int {secret_int} fidelity: {fidelity}")
     
     return counts, fidelity
@@ -178,6 +180,11 @@ def compute_objective(results, nodes, edges):
         sum_count += count
 
     return avg/sum_count
+    
+
+# Custom plotting function
+def plot_area_curve(iter_metrics):
+    
 
 
 ################ Benchmark Loop
@@ -216,16 +223,14 @@ def run (min_qubits=3, max_qubits=6, max_circuits=3, num_shots=100,
 
     def execution_handler2 (qc, result, num_qubits, s_int, num_shots):
         global saved_result
-        global instance_filename
+        global circuits_done
         
-        nodes, edges = common.read_maxcut_instance(instance_filename)
-        opt, _ = common.read_maxcut_solution(instance_filename)
-        
-        f = -1 * compute_objective(result, nodes, edges) / opt
-        metrics.store_metric(num_qubits, s_int, 'fidelity', f)
-        
-        saved_result = result
+        nq = int(int(num_qubits)/1000)
+        counts, fidelity = analyze_and_print_result(qc, result, nq, circuits_done, num_shots)
+        metrics.store_metric(num_qubits, s_int, 'fidelity', fidelity)
      
+        saved_result = result
+        
     # Initialize execution module using the execution result handler above and specified backend_id
     if method == 2:
         ex.max_shots = 1
@@ -238,11 +243,13 @@ def run (min_qubits=3, max_qubits=6, max_circuits=3, num_shots=100,
 
     # for noiseless simulation, set noise model to be None
     # ex.set_noise_model(None)
+    
+    opt_angles = []
 
     # Execute Benchmark Program N times for multiple circuit sizes
     # Accumulate metrics asynchronously as circuits complete
     # DEVNOTE: increment by 2 to match the collection of problems in 'instance' folder
-    for p_depth in [2, 4]:
+    for p_depth in [2]:
         for num_qubits in range(min_qubits, max_qubits + 1, 2):
             
             # determine number of circuits to execute for this group
@@ -253,14 +260,14 @@ def run (min_qubits=3, max_qubits=6, max_circuits=3, num_shots=100,
           
             # loop over limited # of inputs for this
             # assume the solution files start with 3 and go up from there
-            circuits_done = 0
             for i in range(3, 3 + max_circuits):
-            
-            
             
                 # create integer that represents the problem instance; use s_int as circuit id
                 s_int = i
                 #print(f"  ... i={i} s_int={s_int}")
+                
+                group_id = num_qubits*1000 + s_int
+                circuits_done = 0
             
                 # create filename from num_qubits and circuit_id (s_int), then load the problem file
                 global instance_filename
@@ -293,50 +300,65 @@ def run (min_qubits=3, max_qubits=6, max_circuits=3, num_shots=100,
                 
             
                 if method == 2:
-                
+                    
+                    opt, sol = common.read_maxcut_solution(instance_filename)                
                     thetas_init = 2*p_depth*[1.0]
                 
-                    def expectation(theta):
+                    def expectation_value(theta):
                         global circuits_done
                     
                         circuits_done += 1
                     
                         # Every circuit needs a unique id; add circuits_done instead of s_int
-                        unique_id = s_int*1000 + circuits_done
+                        unique_id = circuits_done
                     
                         # create the circuit for given qubit size and secret string, store time metric
                         ts = time.time()
                         qc = MaxCut(num_qubits, unique_id, edges, method, rounds, theta)
-                        metrics.store_metric(num_qubits, unique_id, 'create_time', time.time()-ts)
+                        metrics.store_metric(group_id, unique_id, 'create_time', time.time()-ts)
 
                         # collapse the sub-circuit levels used in this benchmark (for qiskit)
                         qc2 = qc.decompose()
-
+                        
                         # submit circuit for execution on target (simulator, cloud simulator, or hardware)
-                        ex.submit_circuit(qc2, num_qubits, unique_id, shots=num_shots)
-                    
+                        ex.submit_circuit(qc2, group_id, unique_id, shots=num_shots)
+                        
                         # Must wait for circuit to complete
-                        #ex.throttle_execution(metrics.finalize_group)
-                        ex.finalize_execution(metrics.finalize_group)
+                        ex.finalize_execution(partial(metrics.finalize_group, report=False), report_end=True)
+                        #ex.finalize_execution(metrics.finalize_group)
+                        
+                        objective = compute_objective(saved_result, nodes, edges)
+                        metrics.store_metric(group_id, unique_id, 'approx_ratio', -1*objective/opt)
                     
-                        return compute_objective(saved_result, nodes, edges)
+                        return objective
                 
-                    res = minimize(expectation, thetas_init, method='COBYLA')
-                    opt, sol = common.read_maxcut_solution(instance_filename)
-                
-                    num_qubits = int(num_qubits)
-                    #counts, fidelity = analyze_and_print_result(qc, result, num_qubits, int(s_int), num_shots)
-                    fidelity = -1 * res.fun / opt #known optimum
-                
-                    metrics.store_metric(num_qubits, s_int, 'fidelity', fidelity)
-                    metrics.store_metric(num_qubits, s_int, 'rounds', p_depth)
-                
-                    #print(res)
-                
-                
+                    res = minimize(expectation_value, thetas_init, method='COBYLA')
+                    app_ratio = -1 * res.fun / opt #known optimum
+                    
+                    iter_metrics = metrics.process_iteration_metrics(group_id)
+                    opt_angles.append([num_qubits, s_int, edges, app_ratio, res.x])
+        
+        #print(iter_metrics)
+        # Submit finalized angles as standalone circuits to evaluate fidelity etc
+        if method == 2:
+            for num_qubits, s_int, edges, app_ratio, theta_opt in opt_angles:
+                ts = time.time()
+                qc = MaxCut(num_qubits, s_int, edges, method, rounds, theta_opt)
+                metrics.store_metric(num_qubits, s_int, 'create_time', time.time()-ts)
+
+                # collapse the sub-circuit levels used in this benchmark (for qiskit)
+                qc2 = qc.decompose()
+
+                # submit circuit for execution on target (simulator, cloud simulator, or hardware)
+                ex.submit_circuit(qc2, num_qubits, s_int, shots=num_shots)
+                    
+                # Recompute fidelity of QAOA at final angles reached 
+                metrics.store_metric(num_qubits, s_int, 'approx_ratio', app_ratio)
+            
+            
         # Wait for some active circuits to complete; report metrics when groups complete
         ex.throttle_execution(metrics.finalize_group)
-        
+                
     # Wait for all active circuits to complete; report metrics when groups complete
     ex.finalize_execution(metrics.finalize_group)
 
@@ -346,6 +368,10 @@ def run (min_qubits=3, max_qubits=6, max_circuits=3, num_shots=100,
 
     # Plot metrics for all circuit sizes
     metrics.plot_metrics(f"Benchmark Results - MaxCut ({method}) - Qiskit")
+    
+    if method == 2:
+        metrics.plot_volumetric_data(ax, w_data, d_tr_data, f_data, depth_base, fill=True,
+                   label=appname, labelpos=(0.4, 0.6), labelrot=15, type=1, w_max=w_max)  
 
 # if main, execute method
 if __name__ == '__main__': run(method=2)
